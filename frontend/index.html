@@ -1453,8 +1453,11 @@ let selectedTier     = 'free';
 let connectedWallet  = null;
 let prophecyWS       = null;
 
-// Backend base URL — same origin when served by backend
-const API_BASE = window.location.origin;
+// Backend base URL — Render backend (frontend is deployed separately on Vercel)
+const BACKEND_URL = 'https://somiprophet.onrender.com';
+const API_BASE = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+  ? window.location.origin
+  : BACKEND_URL;
 
 /* ── ACCOUNTABILITY: load homepage stats + track record ── */
 async function loadStats(){
@@ -1520,7 +1523,9 @@ async function loadTrackRecord(){
   }
 }
 
-const WS_BASE  = (window.location.protocol === 'https:' ? 'wss://' : 'ws://') + window.location.host;
+const WS_BASE  = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+  ? (window.location.protocol === 'https:' ? 'wss://' : 'ws://') + window.location.host
+  : BACKEND_URL.replace(/^http/, 'ws');
 
 // Tier — free only for now (sealed locked)
 function selectTier(tier){
@@ -1620,18 +1625,18 @@ function renderProphecy(result){
     </div>
     <div class="section gold">
       <div class="section-head gold">📰 News Read</div>
-      <div class="section-body">${result.sentimentSummary||('Sentiment: '+(result.sentiment||'No data'))}</div>
+      <div class="section-body">${result.offchainBriefing||result.sentimentSummary||('Sentiment: '+(result.sentiment||'No data'))}</div>
     </div>
     <div class="section red">
       <div class="section-head red">⚠️ Watch For</div>
       <div class="section-body">${(result.risks||[]).map(r=>'• '+r).join('<br>')}</div>
     </div>
     <div class="section gold" style="margin-top:0.8rem;">
-      <div class="section-head gold">📋 Consensus Summary</div>
+      <div class="section-head gold">📋 Position Scoring</div>
       <div class="section-body">
-        Onchain vote: ${result.voteSplit||'N/A'} ·
-        Sentiment: ${result.sentiment||'N/A'} ·
-        Final score: ${result.finalScore||0}%
+        Onchain: ${result.onchainStrength||0}%${result.onchainLean?' (leaning '+result.onchainLean+')':''} ·
+        Offchain: ${result.offchainStrength||0}%${result.offchainLean?' (leaning '+result.offchainLean+')':''}
+        ${result.conclusion?'<br><br>'+result.conclusion:''}
       </div>
     </div>`;
 

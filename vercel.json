@@ -1,0 +1,10 @@
+{
+  "builds": [
+    { "src": "frontend/**", "use": "@vercel/static" }
+  ],
+  "routes": [
+    { "src": "/", "dest": "/frontend/index.html" },
+    { "src": "/flowchart", "dest": "/frontend/flowchart.html" },
+    { "src": "/(.*)", "dest": "/frontend/$1" }
+  ]
+}

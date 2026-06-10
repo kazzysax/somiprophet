@@ -43,66 +43,76 @@ async function getWalletPosition(walletAddress, marketId) {
 }
 
 /**
- * Run the vote across all admitted wallets
- * Streams each vote live to UI
+ * Run the vote across all admitted wallets — CONVICTION-WEIGHTED.
+ *
+ * Not 1-wallet-1-vote. Each wallet's influence =
+ *   skillEdge × (1 + stakeWeight)
+ * where skillEdge = max(win_rate - 0.5, 0.01) and
+ *       stakeWeight = ln(1 + $size).
+ * A 75%-win whale with $40k outweighs a 55% trader with $20.
+ * Raw counts still tracked for display.
  */
 async function runVote({ wallets, marketId, pushUpdate, requestId }) {
-  let yesCount = 0;
-  let noCount  = 0;
-  let yesWallets = [];
-  let noWallets  = [];
+  let yesCount = 0, noCount = 0;
+  let yesWeight = 0, noWeight = 0;
+  let yesWallets = [], noWallets = [];
 
   for (const wallet of wallets) {
-    // Prefer the position we already learned from /holders
-    // (wallet.position is "YES"/"NO" from the holders endpoint).
-    // Only re-fetch if it's unknown.
     let vote = null;
+    let size = wallet.amount || wallet.size || 0;
+
     if (wallet.position === "YES" || wallet.position === "NO") {
       vote = wallet.position;
     } else {
       const position = await getWalletPosition(wallet.address, marketId);
       vote = position?.vote || null;
+      if (position?.size) size = position.size;
     }
+
+    const skillEdge   = Math.max((wallet.win_rate || 0.5) - 0.5, 0.01);
+    const stakeWeight = Math.log(1 + Math.max(size, 1));
+    const influence   = skillEdge * (1 + stakeWeight);
 
     if (vote === "YES") {
-      yesCount++;
-      yesWallets.push(wallet);
+      yesCount++; yesWeight += influence; yesWallets.push(wallet);
     } else if (vote === "NO") {
-      noCount++;
-      noWallets.push(wallet);
+      noCount++;  noWeight  += influence; noWallets.push(wallet);
     }
 
-    // Stream vote live to UI
     pushUpdate(requestId, {
       type:     "vote",
       wallet:   wallet.address.slice(0, 6) + "..." + wallet.address.slice(-4),
-      win_rate: `${Math.round(wallet.win_rate * 100)}%`,
+      win_rate: `${Math.round((wallet.win_rate || 0) * 100)}%`,
       vote:     vote || "NO POSITION",
-      yesCount,
-      noCount
+      yesCount, noCount
     });
 
     await new Promise(r => setTimeout(r, 200));
   }
 
-  const total   = yesCount + noCount;
-  const verdict = yesCount > noCount ? "YES"
-    : noCount  > yesCount ? "NO"
+  const total       = yesCount + noCount;
+  const totalWeight = yesWeight + noWeight;
+
+  const verdict = totalWeight === 0 ? "INCONCLUSIVE"
+    : yesWeight > noWeight ? "YES"
+    : noWeight  > yesWeight ? "NO"
     : "INCONCLUSIVE";
 
-  const voteConfidence = total > 0
-    ? Math.round((Math.max(yesCount, noCount) / total) * 100)
+  const voteConfidence = totalWeight > 0
+    ? Math.round((Math.max(yesWeight, noWeight) / totalWeight) * 100)
     : 0;
 
+  const weightedYesProb = totalWeight > 0 ? yesWeight / totalWeight : 0.5;
+
   return {
-    yesCount,
-    noCount,
-    total,
+    yesCount, noCount, total,
+    yesWeight: Math.round(yesWeight * 100) / 100,
+    noWeight:  Math.round(noWeight * 100) / 100,
+    weightedYesProb,
     verdict,
     voteConfidence,
-    voteSplit:  `${yesCount}/${total}`,
-    yesWallets,
-    noWallets,
+    voteSplit: `${yesCount}/${total}`,
+    yesWallets, noWallets,
   };
 }
 

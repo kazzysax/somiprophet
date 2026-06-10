@@ -311,6 +311,7 @@ async function fetchWallets({ marketId, marketSlug, pushUpdate, requestId }) {
         return {
           address:             addr,
           position:            w.outcome || "UNKNOWN",
+          amount:              Number(w.amount || 0),
           win_rate:            w.win_rate,
           markets_traded:      w.markets_traded || 0,
           sybil_risk_flag:     false,
@@ -326,6 +327,7 @@ async function fetchWallets({ marketId, marketSlug, pushUpdate, requestId }) {
       return {
         address:              addr,
         position:             w.outcome || "UNKNOWN",
+        amount:               Number(w.amount || 0),
         win_rate:             details.win_rate,
         markets_traded:       details.markets_traded,
         sybil_risk_flag:      details.sybil_risk_flag,
@@ -386,7 +388,25 @@ async function fetchWallets({ marketId, marketSlug, pushUpdate, requestId }) {
     minViableNeeded:       WALLET_CONFIG.minViable
   };
 
+  // PARTIAL-SIGNAL MODE: 2-4 strong wallets is thin but real information.
+  // Proceed with a partial vote; the orchestrator scales the onchain weight down.
   if (admittedWallets.length < WALLET_CONFIG.minViable) {
+    const bestAvailable = validWallets.sort((a, b) => b.win_rate - a.win_rate).slice(0, WALLET_CONFIG.target);
+    if (bestAvailable.length >= 2) {
+      diagnostics.admittedToVote = bestAvailable.length;
+      return {
+        success:       true,
+        partial:       true,
+        wallets:       bestAvailable,
+        thresholdUsed: WALLET_CONFIG.floor,
+        gateLabel:     "🟠 PARTIAL SIGNAL",
+        stepDownCount,
+        lowConfidence: true,
+        totalAnalysed: validWallets.length,
+        diagnostics,
+        message:       `Only ${bestAvailable.length} wallets of credible strength found — below the ${WALLET_CONFIG.minViable} needed for a full consensus, but enough for a partial onchain read.`
+      };
+    }
     // Build a precise human-readable reason
     let reason;
     if (rawWallets.length === 0) {

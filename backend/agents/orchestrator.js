@@ -98,7 +98,8 @@ async function runProphecy({
       walletDiagnostics = walletResult.diagnostics || null;
       walletMessage     = walletResult.message || null;
 
-      if (!walletResult.success || walletResult.wallets.length < 5) {
+      if (!walletResult.success) {
+        // Truly no usable signal (0-1 wallets)
         onchainWeight = 0;
         const d = walletResult.diagnostics || {};
         pushUpdate(requestId, {
@@ -108,6 +109,22 @@ async function runProphecy({
           status: "warning",
           message: walletResult.message,
           diagnostics: d,
+          gasUsed: walletAgent.gasUsed
+        });
+      } else if (walletResult.partial) {
+        // PARTIAL SIGNAL (2-4 wallets): real but thin.
+        // Scale onchain weight down proportionally (n/5 of a moderate 0.55).
+        const n = walletResult.wallets.length;
+        onchainWeight = parseFloat((0.55 * (n / 5)).toFixed(2));  // e.g. 2 wallets → 0.22
+        pushUpdate(requestId, {
+          type: "step", step: 2,
+          agent: "SOMIPROPHET_WALLET_FETCHER",
+          label: `🐋 ${n} strong wallet${n === 1 ? "" : "s"} — partial onchain signal`,
+          status: "done",
+          walletCount: n,
+          partial: true,
+          threshold: walletResult.thresholdUsed,
+          diagnostics: walletResult.diagnostics,
           gasUsed: walletAgent.gasUsed
         });
       } else {
@@ -287,6 +304,8 @@ async function runProphecy({
         verdict:         prophecy.verdict,
         probability:     prophecy.probability,
         onchainBriefing: prophecy.onchain_briefing || walletMessage || "No onchain data.",
+        offchainBriefing: prophecy.offchain_briefing || sentimentResult.summary || null,
+        conclusion:      prophecy.conclusion || null,
         assessment:      prophecy.assessment,
         factors:         prophecy.factors,
         risks:           prophecy.risks,
@@ -296,6 +315,10 @@ async function runProphecy({
           : "N/A",
         onchainScore:    prophecy.onchainScore,
         offchainScore:   prophecy.offchainScore,
+        onchainStrength:  prophecy.onchainStrength ?? 0,
+        offchainStrength: prophecy.offchainStrength ?? 0,
+        onchainLean:     prophecy.onchainLean || null,
+        offchainLean:    prophecy.offchainLean || null,
         finalScore:      prophecy.finalScore,
         confidence:      prophecy.confidence,
         gateLevel:       prophecy.gateLevel,

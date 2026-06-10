@@ -49,14 +49,14 @@ async function writeMarketMatch(data) {
         ps_entity, ps_event, ps_metric, ps_operator,
         ps_threshold, ps_location, ps_type,
         ps_resolution_source, ps_resolves_yes_if,
-        pm_market_id, pm_market_name, pm_criteria_raw,
+        pm_market_id, pm_market_slug, pm_market_name, pm_criteria_raw,
         match_confidence, match_method, llm_verdict,
         llm_explanation, structured_score, simulation_passed,
         user_confirmed
       ) VALUES (
         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
         $11,$12,$13,$14,$15,$16,$17,$18,
-        $19,$20,$21,$22,$23,$24,$25
+        $19,$20,$21,$22,$23,$24,$25,$26
       )
       ON CONFLICT DO NOTHING
     `, [
@@ -68,6 +68,7 @@ async function writeMarketMatch(data) {
       data.ps_threshold,      data.ps_location,
       data.ps_type,           data.ps_resolution_source,
       data.ps_resolves_yes_if, data.pm_market_id,
+      data.pm_market_slug || null,
       data.pm_market_name,    data.pm_criteria_raw,
       data.match_confidence,  data.match_method || 'llm',
       data.llm_verdict,       data.llm_explanation,

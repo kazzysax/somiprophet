@@ -1,564 +1,355 @@
 /**
- * SOMIPROPHET — Market Matcher Agent
- * Implements all 8 matching models:
- * 1. Memory check first
- * 2. Structured criteria parser
- * 3. Resolution logic normaliser
- * 4. Broad Polymarket search
- * 5. Hard rejection filters
- * 6. Weighted scoring (50/20/15/10/5)
- * 7. LLM logic comparator
- * 8. Resolution simulation
+ * SOMIPROPHET — Market Matcher (v3, logical)
+ * ============================================
+ * Design philosophy:
+ *   Retrieval is WIDE and dumb. Judgment is NARROW and smart.
+ *
+ * Four stages:
+ *   1. UNDERSTAND  — one LLM call turns the user's market into a
+ *                    structured "claim": subject(s), the event, the
+ *                    exact measurable condition, the resolution date,
+ *                    and a ranked list of search queries.
+ *   2. RETRIEVE    — fire those queries across 3 Polymarket endpoints,
+ *                    collect a wide, de-duplicated candidate pool.
+ *   3. SHORTLIST   — cheap, deterministic pre-rank by lexical + entity
+ *                    overlap to cut the pool to the best ~8. No verdicts
+ *                    here, just "which are worth a careful look."
+ *   4. JUDGE       — ONE LLM call ranks the shortlist and returns the
+ *                    single best match with an explicit verdict and a
+ *                    calibrated confidence. The verdict is authoritative;
+ *                    confidence can never be read backwards.
+ *
+ * Output contract (used by orchestrator):
+ *   { success, confidence, marketId, marketSlug, polymarketName,
+ *     llmVerdict, llmExplanation, message, scoredCandidates,
+ *     searchPlan, totalCandidates, rawSearchLog }
  */
 
 const axios     = require("axios");
 const Anthropic  = require("@anthropic-ai/sdk").default;
 const { APPROVED_SOURCES } = require("../config/sources");
 
-const client   = new Anthropic({ apiKey: process.env.CLAUDE_API_KEY });
-const GAMMA    = APPROVED_SOURCES.onchain.polymarket.gamma;
+const client = new Anthropic({ apiKey: process.env.CLAUDE_API_KEY });
+const MODEL  = process.env.CLAUDE_MODEL || "claude-sonnet-4-6";
+const GAMMA  = APPROVED_SOURCES.onchain.polymarket.gamma;
 
-/**
- * MODEL 1 — Memory check (Supabase-backed, with in-RAM fallback)
- * If DATABASE_URL is set, confirmed matches persist to Supabase
- * and are reused across restarts. Otherwise falls back to RAM.
- */
+const ACCEPT_THRESHOLD = 0.62;
+
+const STOP = new Set(["will","the","new","by","or","and","be","a","an","on","of","is","for",
+  "to","than","that","this","with","at","in","it","as","are","was","reach","above","below","before","after"]);
+
+// ──────────────────────────────────────────────────────────
+//  MEMORY  (Supabase-backed, RAM fallback)
+// ──────────────────────────────────────────────────────────
 const memoryCache = new Map();
 let db = null;
-try {
-  if (process.env.DATABASE_URL) {
-    db = require("../config/database");
-  }
-} catch (e) {
-  console.error("[MarketMatcher] DB module load failed, using RAM:", e.message);
-}
+try { if (process.env.DATABASE_URL) db = require("../config/database"); }
+catch (e) { console.error("[Matcher] DB load failed, RAM only:", e.message); }
 
-async function checkMemory(criteriaHash) {
-  // RAM first (fast)
-  if (memoryCache.has(criteriaHash)) return memoryCache.get(criteriaHash);
-  // Supabase next
+function hashCriteria(s) {
+  return Buffer.from((s || "").toLowerCase().replace(/\s+/g, " ").trim()).toString("base64").slice(0, 60);
+}
+async function checkMemory(hash) {
+  if (memoryCache.has(hash)) return memoryCache.get(hash);
   if (db) {
     try {
-      const row = await db.findCachedMatch(criteriaHash);
-      if (row) {
-        return {
-          success: true,
-          confidence: row.match_confidence,
-          marketId: row.pm_market_id,
-          polymarketName: row.pm_market_name,
-          fromMemory: true
-        };
-      }
-    } catch (e) { /* fall through */ }
+      const row = await db.findCachedMatch(hash);
+      if (row) return { success: true, confidence: row.match_confidence, marketId: row.pm_market_id,
+                        marketSlug: row.pm_market_slug || null,
+                        polymarketName: row.pm_market_name, fromMemory: true };
+    } catch { /* ignore */ }
   }
   return null;
 }
-
-async function writeMemory(criteriaHash, result) {
-  memoryCache.set(criteriaHash, { ...result, cachedAt: Date.now() });
+async function writeMemory(hash, result) {
+  memoryCache.set(hash, { ...result, cachedAt: Date.now() });
   if (db) {
     try {
       await db.writeMarketMatch({
-        ps_criteria_hash: criteriaHash,
-        ps_market_name:   result.polymarketName || "",
-        ps_criteria_raw:  result.criteriaRaw || "",
-        pm_market_id:     result.marketId,
-        pm_market_name:   result.polymarketName,
-        match_confidence: result.confidence,
-        match_method:     "llm",
-        llm_verdict:      result.llmVerdict,
-        llm_explanation:  result.llmExplanation,
-        user_confirmed:   false
+        ps_criteria_hash: hash, ps_market_name: result.polymarketName || "",
+        ps_criteria_raw: result._criteriaRaw || "", pm_market_id: result.marketId,
+        pm_market_slug: result.marketSlug || null,
+        pm_market_name: result.polymarketName, match_confidence: result.confidence,
+        match_method: "llm-v3", llm_verdict: result.llmVerdict,
+        llm_explanation: result.llmExplanation, user_confirmed: false
       });
-    } catch (e) { /* RAM still holds it */ }
+    } catch { /* RAM holds it */ }
   }
 }
 
-/**
- * NEW — Extract a smart SEARCH PLAN from the user's market.
- * Pulls key entities (teams/people/countries), event type, and date
- * so we search Polymarket the way a human would: find the entities,
- * then find where they appear TOGETHER.
- */
-async function extractSearchPlan(marketName, resolutionCriteria, category) {
-  try {
-    const resp = await client.messages.create({
-      model:      process.env.CLAUDE_MODEL || "claude-sonnet-4-6",
-      max_tokens: 350,
-      messages:   [{
-        role: "user",
-        content: `Analyse this prediction market and extract a search plan to find it on Polymarket.
+// ──────────────────────────────────────────────────────────
+//  STAGE 1 — UNDERSTAND
+// ──────────────────────────────────────────────────────────
+async function understand(marketName, resolutionCriteria, category, resolutionDate) {
+  const prompt = `You convert a prediction market into a structured claim and a Polymarket search plan.
 
-Market: "${marketName}"
-Criteria: "${resolutionCriteria}"
-Category: "${category}"
+USER MARKET
+  Title:    "${marketName}"
+  Criteria: "${resolutionCriteria || "(none provided)"}"
+  Category: "${category || "(none)"}"
+  Date:     "${resolutionDate || "(none)"}"
 
-Extract:
-- entities: the key named subjects (teams, people, countries, assets). For a match between two teams, list BOTH (e.g. ["Portugal","Spain"]).
-- event: the event they belong to (e.g. "World Cup", "2026 election", "Bitcoin price")
-- eventType: one of MATCH_BETWEEN_TWO | SINGLE_OUTCOME | PRICE_LEVEL | ELECTION | OTHER
-- date: the resolution/event date in YYYY-MM-DD if known, else null
-- searchQueries: 3-5 SHORT search strings (1-4 words), best first. For a two-entity match include each entity AND the pair (e.g. ["Portugal Spain","Portugal","Spain World Cup","World Cup score"]).
-
-Respond ONLY with JSON:
-{ "entities": [], "event": "", "eventType": "", "date": null, "searchQueries": [] }`
-      }]
-    });
-    return JSON.parse(resp.content[0].text.replace(/```json|```/g, "").trim());
-  } catch (err) {
-    console.error("[MarketMatcher] extractSearchPlan error:", err.message);
-    return null;
-  }
-}
-
-/**
- * MODEL 2+3 — Parse and normalise resolution criteria via LLM
- */
-async function parseCriteria(criteria) {
-  const resp = await client.messages.create({
-    model:      process.env.CLAUDE_MODEL || "claude-sonnet-4-6",
-    max_tokens: 300,
-    messages:   [{
-      role:    "user",
-      content: `Extract structured fields from this prediction market resolution criteria.
-Respond ONLY with JSON, no extra text:
-
-Criteria: "${criteria}"
-
+Return STRICT JSON, no prose, no markdown:
 {
-  "entity": "the subject (e.g. BTC, Donald Trump, Arsenal FC)",
-  "event": "what must happen (e.g. price exceeds, wins election, scores goal)",
-  "metric": "how measured (e.g. closing price, vote count, match score)",
-  "operator": "GREATER_THAN | LESS_THAN | EQUAL_TO | WINS | HAPPENS",
-  "threshold": "the value or condition (e.g. 100000, majority, first place)",
-  "location": "where applicable (e.g. USA, UK, Global, N/A)",
-  "deadline": "resolution deadline if mentioned",
-  "type": "THRESHOLD | EVENT | COMPARATIVE | TIME_BOUND | BINARY",
-  "resolution_source": "who decides YES/NO (e.g. CoinGecko, AP News, FIFA, N/A)",
-  "resolves_yes_if": "plain English summary of YES condition"
-}`
-    }]
+  "subjects": [],          // concrete named entities the market is ABOUT (teams, people, countries, assets, tickers). For an A-vs-B event, list BOTH.
+  "subjectAliases": {},    // for EACH subject, an array of common aliases/abbreviations/full names (e.g. {"Man City": ["Manchester City", "MCFC"], "US": ["USA", "United States", "America"]}). Empty arrays are fine.
+  "event": "",             // umbrella event if any (e.g. "2026 World Cup", "US Presidential Election", "Bitcoin price")
+  "claimType": "",         // one of: MATCH_RESULT | EXACT_SCORE | THRESHOLD | YES_NO_EVENT | ELECTION | RANGE | OTHER
+  "measurable": "",        // the exact condition that decides YES, in one plain sentence
+  "direction": "",         // what makes it resolve YES, <=10 words
+  "date": null,            // ISO yyyy-mm-dd if a specific date is implied, else null
+  "searchQueries": []      // 4-6 SHORT queries (1-4 words) best-first. Include each subject alone, the subject pair, and the event. Use common aliases (US/USA, BTC/Bitcoin).
+}`;
+  try {
+    const r = await client.messages.create({ model: MODEL, max_tokens: 500,
+      messages: [{ role: "user", content: prompt }] });
+    const plan = JSON.parse(r.content[0].text.replace(/```json|```/g, "").trim());
+    plan.subjects = (plan.subjects || []).filter(Boolean);
+    plan.subjectAliases = plan.subjectAliases || {};
+    plan.searchQueries = (plan.searchQueries || []).filter(Boolean);
+    if (plan.searchQueries.length === 0) plan.searchQueries = fallbackQueries(marketName);
+    return plan;
+  } catch (e) {
+    console.error("[Matcher] understand() error:", e.message);
+    return { subjects: [], event: "", claimType: "OTHER", measurable: marketName,
+             direction: "", date: resolutionDate || null, searchQueries: fallbackQueries(marketName) };
+  }
+}
+function fallbackQueries(marketName) {
+  const words = marketName.replace(/[?"'.]/g, "").split(/\s+/)
+    .filter(w => w.length > 3 && !STOP.has(w.toLowerCase()));
+  return [words.slice(0, 4).join(" "), ...words.slice(0, 3)].filter(Boolean);
+}
+
+// ──────────────────────────────────────────────────────────
+//  STAGE 2 — RETRIEVE
+// ──────────────────────────────────────────────────────────
+function normMarket(m, evTitle, source) {
+  const id = m.conditionId || m.condition_id || m.id;
+  if (!id) return null;
+  return {
+    id,
+    slug: m.slug || m.market_slug || null,
+    question: m.question || m.title || evTitle || "",
+    description: m.description || "",
+    closed: m.closed === true || m.active === false,
+    volume: Number(m.volume || m.volumeNum || 0),
+    endDate: m.endDate || m.end_date_iso || null,
+    _source: source
+  };
+}
+async function retrieve(queries) {
+  const pool = new Map();
+  const log = [];
+  const add = (m) => { if (m && !pool.has(m.id)) pool.set(m.id, m); };
+
+  // Fire ALL queries across ALL endpoints in PARALLEL (was 18 sequential calls)
+  const jobs = [];
+  for (const q of queries.slice(0, 6)) {
+    jobs.push(
+      axios.get(`${GAMMA}/public-search`, { params: { q, limit_per_type: 20 }, timeout: 10000 })
+        .then(({ data }) => {
+          (data.markets || []).forEach(m => add(normMarket(m, null, "search")));
+          (data.events || []).forEach(ev => (ev.markets || [])
+            .forEach(m => add(normMarket(m, ev.title, "search-event"))));
+          log.push({ ep: "public-search", q, markets: (data.markets||[]).length, events: (data.events||[]).length });
+        })
+        .catch(e => log.push({ ep: "public-search", q, error: e.message })),
+
+      axios.get(`${GAMMA}/events`, { params: { _q: q, limit: 12, order: "volume24hr", ascending: false }, timeout: 10000 })
+        .then(({ data }) => {
+          const evs = data.data || data || [];
+          (Array.isArray(evs) ? evs : []).forEach(ev => (ev.markets || [])
+            .forEach(m => add(normMarket(m, ev.title, "events"))));
+          log.push({ ep: "events", q, events: Array.isArray(evs) ? evs.length : 0 });
+        })
+        .catch(e => log.push({ ep: "events", q, error: e.message })),
+
+      axios.get(`${GAMMA}/markets`, { params: { _q: q, limit: 20, order: "volume24hr", ascending: false }, timeout: 10000 })
+        .then(({ data }) => {
+          const ms = data.data || data || [];
+          (Array.isArray(ms) ? ms : []).forEach(m => add(normMarket(m, null, "markets")));
+          log.push({ ep: "markets", q, markets: Array.isArray(ms) ? ms.length : 0 });
+        })
+        .catch(e => log.push({ ep: "markets", q, error: e.message }))
+    );
+  }
+  await Promise.allSettled(jobs);
+  return { candidates: [...pool.values()], log };
+}
+
+// ──────────────────────────────────────────────────────────
+//  STAGE 3 — SHORTLIST
+// ──────────────────────────────────────────────────────────
+function tokenize(s) {
+  return (s || "").toLowerCase().replace(/[^a-z0-9$ ]/g, " ")
+    .split(/\s+/).filter(w => w.length > 2 && !STOP.has(w));
+}
+/** A subject is "present" if the subject itself OR any of its aliases appears. */
+function subjectsPresent(plan, text) {
+  const t = (text || "").toLowerCase();
+  const aliases = plan.subjectAliases || {};
+  return (plan.subjects || []).filter(s => {
+    const names = [s, ...(aliases[s] || [])].map(x => String(x).toLowerCase()).filter(Boolean);
+    return names.some(n => t.includes(n));
   });
-  try {
-    return JSON.parse(resp.content[0].text.replace(/```json|```/g, "").trim());
-  } catch {
-    return null;
-  }
+}
+/** Date proximity score: dated events should match markets ending near that date. */
+function dateScore(plan, candidate) {
+  if (!plan.date || !candidate.endDate) return 0;
+  const d1 = new Date(plan.date).getTime();
+  const d2 = new Date(candidate.endDate).getTime();
+  if (isNaN(d1) || isNaN(d2)) return 0;
+  const days = Math.abs(d1 - d2) / 86400000;
+  if (days <= 3)  return 20;    // same fixture window
+  if (days <= 14) return 8;
+  if (days <= 45) return 0;
+  return -15;                   // wrong edition / different event
+}
+function preRank(plan, candidates) {
+  const subjects = (plan.subjects || []).map(s => s.toLowerCase());
+  const userTokens = new Set([
+    ...tokenize(plan.measurable), ...tokenize(plan.event),
+    ...subjects.flatMap(s => tokenize(s))
+  ]);
+
+  return candidates.map(c => {
+    const text = `${c.question} ${c.description}`;
+    const cTokens = new Set(tokenize(text));
+
+    const present = subjectsPresent(plan, text);
+    let entityScore;
+    if (subjects.length >= 2)      entityScore = present.length >= 2 ? 60 : present.length === 1 ? 12 : -20;
+    else if (subjects.length === 1) entityScore = present.length === 1 ? 35 : -10;
+    else                            entityScore = 0;
+
+    let overlap = 0;
+    userTokens.forEach(t => { if (cTokens.has(t)) overlap++; });
+    const lexScore = userTokens.size ? (overlap / userTokens.size) * 30 : 0;
+    const volNudge = c.volume > 0 ? Math.min(Math.log10(c.volume + 1), 6) : 0;
+    const dScore   = dateScore(plan, c);
+
+    return { ...c, _pre: entityScore + lexScore + volNudge + dScore,
+             _entityPresent: present.length, _entityTotal: subjects.length };
+  }).sort((a, b) => b._pre - a._pre);
 }
 
-/**
- * MODEL 4 — Broad Polymarket search (keyword-driven)
- * Uses the dedicated /search endpoint for full-text keyword search,
- * which searches across markets, events, and profiles.
- * Falls back to high-volume active markets if search returns nothing.
- */
-async function searchPolymarket(searchTerms, resolutionDate) {
-  const allResults = [];
-  const seen = new Set();
+// ──────────────────────────────────────────────────────────
+//  STAGE 4 — JUDGE
+// ──────────────────────────────────────────────────────────
+async function judge(plan, marketName, resolutionCriteria, shortlist) {
+  const listText = shortlist.map((c, i) =>
+    `[${i}] "${c.question}"${c.endDate ? ` (ends ${String(c.endDate).slice(0,10)})` : ""}${c.volume ? ` ($${Math.round(c.volume).toLocaleString()} vol)` : ""}${c.description ? ` — ${c.description.slice(0, 140)}` : ""}`
+  ).join("\n");
 
-  const queries = searchTerms.filter(Boolean).slice(0, 5);
+  const prompt = `You decide which Polymarket market (if any) resolves under the SAME real-world outcome as the user's market.
 
-  for (const query of queries) {
-    try {
-      // Dedicated full-text search endpoint
-      const resp = await axios.get(`${GAMMA}/public-search`, {
-        params: { q: query, limit_per_type: 20 }
-      });
+USER MARKET
+  Title:    "${marketName}"
+  Means:    "${plan.measurable || resolutionCriteria}"
+  Subjects: ${JSON.stringify(plan.subjects || [])}
+  Resolves YES if: "${plan.direction || "(see criteria)"}"
 
-      // Search returns { events: [...], markets: [...], profiles: [...] }
-      const markets = resp.data?.markets || [];
-      const events  = resp.data?.events  || [];
+CANDIDATES
+${listText}
 
-      // Markets directly
-      for (const m of markets) {
-        const id = m.conditionId || m.condition_id || m.id;
-        if (id && !seen.has(id)) { seen.add(id); allResults.push(m); }
-      }
-      // Markets nested inside events
-      for (const ev of events) {
-        const evMarkets = ev.markets || [];
-        for (const m of evMarkets) {
-          const id = m.conditionId || m.condition_id || m.id;
-          if (id && !seen.has(id)) {
-            seen.add(id);
-            // attach event question for context
-            allResults.push({ ...m, question: m.question || ev.title });
-          }
-        }
-      }
-    } catch (err) {
-      console.error(`[MarketMatcher] Search "${query}" error:`, err.message);
-    }
-  }
+RULES (apply strictly):
+- A real match resolves YES/NO on the SAME event, SAME subjects, SAME measurable condition. Wording may differ.
+- Different teams/people/countries  -> NOT a match (e.g. "Norway vs Senegal" is NOT "Portugal win").
+- Different measure of the same event -> at best PARTIAL (e.g. "who wins" vs "exact score").
+- Different date/edition of an event  -> NOT a match.
+- If nothing fits, say so honestly. A wrong match is far worse than no match.
 
-  // Fallback: high-volume active markets
-  if (allResults.length === 0) {
-    try {
-      const resp = await axios.get(`${GAMMA}/markets`, {
-        params: { active: true, closed: false, limit: 100, order: "volume24hr", ascending: false }
-      });
-      const markets = resp.data?.data || resp.data || [];
-      markets.forEach(m => {
-        const id = m.conditionId || m.condition_id || m.id;
-        if (id && !seen.has(id)) { seen.add(id); allResults.push(m); }
-      });
-    } catch (err) {
-      console.error("[MarketMatcher] Fallback search error:", err.message);
-    }
-  }
-
-  console.log(`[MarketMatcher] Found ${allResults.length} candidate markets`);
-  return allResults;
-}
-
-/**
- * MODEL 5 — Hard rejection filters
- * Returns true ONLY for clear, unambiguous mismatches.
- * Conservative — when in doubt, let it through to the LLM judge.
- */
-function hardReject(userParsed, candidateParsed) {
-  if (!userParsed || !candidateParsed) return false;
-
-  // Entity mismatch — use word overlap, not strict substring
-  // "US" should match "United States", "BTC" should match "Bitcoin"
-  if (userParsed.entity && candidateParsed.entity) {
-    const userEntity = userParsed.entity.toLowerCase();
-    const candEntity = candidateParsed.entity.toLowerCase();
-
-    // Known aliases that should never be rejected
-    const aliases = [
-      ["us", "u.s.", "usa", "united states", "america", "american"],
-      ["btc", "bitcoin"],
-      ["eth", "ethereum"],
-      ["uk", "u.k.", "united kingdom", "britain", "british"]
-    ];
-
-    let aliasMatch = false;
-    for (const group of aliases) {
-      const userIn = group.some(a => userEntity.includes(a));
-      const candIn = group.some(a => candEntity.includes(a));
-      if (userIn && candIn) { aliasMatch = true; break; }
-    }
-
-    if (!aliasMatch) {
-      // Check word overlap
-      const sim = stringSimilarity(userEntity, candEntity);
-      const substringMatch = userEntity.includes(candEntity) ||
-                             candEntity.includes(userEntity);
-      // Only reject if NO overlap at all
-      if (sim === 0 && !substringMatch) {
-        return true;
-      }
-    }
-  }
-
-  // NOTE: Removed rigid type check — the LLM parser labels the same
-  // event inconsistently (EVENT vs BINARY vs TIME_BOUND), causing
-  // false rejections. The LLM logic comparator handles type nuance.
-
-  return false;
-}
-
-/**
- * MODEL 6 — Weighted scoring
- * Resolution: 50% | Event: 20% | Entity: 15% | Timeframe: 10% | Title: 5%
- */
-function scoreCandidate(userParsed, candidate, candidateParsed, userTitle, resolutionDate) {
-  let score = 0;
-
-  // Resolution logic similarity (50%)
-  if (userParsed?.resolves_yes_if && candidateParsed?.resolves_yes_if) {
-    const sim = stringSimilarity(
-      userParsed.resolves_yes_if.toLowerCase(),
-      candidateParsed.resolves_yes_if.toLowerCase()
-    );
-    score += sim * 50;
-  }
-
-  // Event match (20%)
-  if (userParsed?.event && candidateParsed?.event) {
-    const sim = stringSimilarity(
-      userParsed.event.toLowerCase(),
-      candidateParsed.event.toLowerCase()
-    );
-    score += sim * 20;
-  }
-
-  // Entity match (15%)
-  if (userParsed?.entity && candidateParsed?.entity) {
-    const sim = stringSimilarity(
-      userParsed.entity.toLowerCase(),
-      candidateParsed.entity.toLowerCase()
-    );
-    score += sim * 15;
-  }
-
-  // Timeframe (10%) — wider, more forgiving window
-  // Markets often have buffer end dates weeks after the event date
-  if (resolutionDate && candidate.end_date_iso) {
-    const userDate = new Date(resolutionDate).getTime();
-    const candDate = new Date(candidate.end_date_iso).getTime();
-    const diffDays = Math.abs(userDate - candDate) / 86400000;
-    if (diffDays <= 3)        score += 10;
-    else if (diffDays <= 14)  score += 8;
-    else if (diffDays <= 30)  score += 6;  // June 9 vs June 30 = 21 days → still scores
-    else if (diffDays <= 60)  score += 3;
-  } else {
-    // No date to compare — give neutral partial credit, don't penalize
-    score += 5;
-  }
-
-  // Title similarity (5%)
-  if (userTitle && candidate.question) {
-    const sim = stringSimilarity(userTitle.toLowerCase(), candidate.question.toLowerCase());
-    score += sim * 5;
-  }
-
-  return Math.round(score);
-}
-
-function stringSimilarity(a, b) {
-  const setA = new Set(a.split(/\s+/));
-  const setB = new Set(b.split(/\s+/));
-  const intersection = [...setA].filter(w => setB.has(w)).length;
-  const union = new Set([...setA, ...setB]).size;
-  return union > 0 ? intersection / union : 0;
-}
-
-/**
- * MODEL 7 — LLM logic comparator (convergent logic check)
- */
-async function llmCompare(userCriteria, candidateCriteria, marketName, candidateName) {
-  const resp = await client.messages.create({
-    model:      process.env.CLAUDE_MODEL || "claude-sonnet-4-6",
-    max_tokens: 200,
-    messages:   [{
-      role:    "user",
-      content: `Do these two prediction markets resolve under the SAME real-world event and outcome?
-
-Market A (user's market): "${marketName}"
-Criteria A: "${userCriteria}"
-
-Market B (Polymarket): "${candidateName}"
-Criteria B: "${candidateCriteria}"
-
-STRICT RULES — answer NO_MATCH if ANY of these differ:
-- Different teams, people, countries, or entities (e.g. "Norway vs Senegal" is NOT "Portugal win" — different teams = NO_MATCH)
-- Different event or match (a different game, election, or date entirely)
-- Different metric (exact score vs win/lose, price level vs direction)
-Only answer MATCH if they resolve YES/NO under the SAME outcome of the SAME event. Wording may differ, but the underlying event and entities must be the same.
-
-"confidence" = how sure you are OF YOUR VERDICT (whether MATCH or NO_MATCH).
-
-Respond ONLY with JSON:
+Return STRICT JSON, no prose:
 {
+  "bestIndex": <integer index of best candidate, or -1 if none fit>,
   "verdict": "MATCH | PARTIAL_MATCH | NO_MATCH",
-  "confidence": 0.0 to 1.0,
-  "explanation": "one sentence explaining the key match/mismatch"
-}`
-    }]
-  });
+  "confidence": <0.0-1.0, confidence that bestIndex resolves on the SAME outcome>,
+  "explanation": "<=20 words why"
+}`;
   try {
-    return JSON.parse(resp.content[0].text.replace(/```json|```/g, "").trim());
-  } catch {
-    return { verdict: "NO_MATCH", confidence: 0, explanation: "Parse error" };
+    const r = await client.messages.create({ model: MODEL, max_tokens: 300,
+      messages: [{ role: "user", content: prompt }] });
+    return JSON.parse(r.content[0].text.replace(/```json|```/g, "").trim());
+  } catch (e) {
+    console.error("[Matcher] judge() error:", e.message);
+    return { bestIndex: -1, verdict: "NO_MATCH", confidence: 0, explanation: "judge failed" };
   }
 }
 
-/**
- * MODEL 8 — Resolution simulation
- * Tests 3 hypothetical scenarios to verify logical equivalence
- */
-async function simulateResolution(userCriteria, candidateCriteria, userParsed) {
-  const resp = await client.messages.create({
-    model:      process.env.CLAUDE_MODEL || "claude-sonnet-4-6",
-    max_tokens: 400,
-    messages:   [{
-      role:    "user",
-      content: `Test these two resolution criteria against 3 hypothetical scenarios.
-Both markets must resolve identically for a valid match.
-
-Criteria A: "${userCriteria}"
-Criteria B: "${candidateCriteria}"
-
-Generate 3 relevant hypothetical scenarios and check resolution for each.
-Respond ONLY with JSON:
-{
-  "scenarios": [
-    {
-      "scenario": "description of what happens",
-      "A_resolves": "YES or NO",
-      "B_resolves": "YES or NO",
-      "agree": true or false
-    }
-  ],
-  "allAgree": true or false,
-  "simulationConfidence": 0.0 to 1.0
-}`
-    }]
-  });
-  try {
-    return JSON.parse(resp.content[0].text.replace(/```json|```/g, "").trim());
-  } catch {
-    return { allAgree: false, simulationConfidence: 0 };
-  }
-}
-
-/**
- * MAIN — Full market matching pipeline
- */
+// ──────────────────────────────────────────────────────────
+//  ORCHESTRATION
+// ──────────────────────────────────────────────────────────
 async function matchMarket({ marketName, marketUrl, resolutionCriteria, category, resolutionDate }) {
-  // MODEL 1 — Memory check
-  const criteriaHash = Buffer.from(resolutionCriteria).toString("base64");
+  const criteriaHash = hashCriteria(`${marketName}|${resolutionCriteria}`);
+
   const cached = await checkMemory(criteriaHash);
-  if (cached && cached.confidence >= 0.85) {
-    console.log("[MarketMatcher] Memory hit!");
-    return { ...cached, fromMemory: true };
+  if (cached) { console.log("[Matcher] memory hit"); return cached; }
+
+  const plan = await understand(marketName, resolutionCriteria, category, resolutionDate);
+  console.log(`[Matcher] subjects=[${(plan.subjects||[]).join(", ")}] type=${plan.claimType}`);
+  console.log(`[Matcher] queries: ${plan.searchQueries.join(" | ")}`);
+
+  const { candidates, log } = await retrieve(plan.searchQueries);
+  console.log(`[Matcher] retrieved ${candidates.length} candidates`);
+  if (candidates.length === 0) return fail("No Polymarket candidates found for this market.", plan, 0, log);
+
+  const ranked = preRank(plan, candidates);
+  const shortlist = ranked.slice(0, 8);
+
+  const j = await judge(plan, marketName, resolutionCriteria, shortlist);
+
+  const idx = Number.isInteger(j.bestIndex) ? j.bestIndex : -1;
+  const best = idx >= 0 && idx < shortlist.length ? shortlist[idx] : null;
+  const conf = typeof j.confidence === "number" ? Math.max(0, Math.min(1, j.confidence)) : 0;
+
+  let finalConfidence, isRealMatch;
+  if (!best || j.verdict === "NO_MATCH") { finalConfidence = best ? 1 - conf : 0; isRealMatch = false; }
+  else if (j.verdict === "MATCH")        { finalConfidence = conf; isRealMatch = true; }
+  else                                   { finalConfidence = conf * 0.6; isRealMatch = conf >= 0.85; }
+
+  // Entity guard (alias-aware): 2 subjects but chosen market has neither -> fail
+  if (best && (plan.subjects || []).length >= 2) {
+    const present = subjectsPresent(plan, `${best.question} ${best.description}`).length;
+    if (present === 0) { isRealMatch = false; finalConfidence = Math.min(finalConfidence, 0.3); }
   }
 
-  // MODEL 2+3 — Parse user criteria
-  const userParsed = await parseCriteria(resolutionCriteria);
+  const success = isRealMatch && finalConfidence >= ACCEPT_THRESHOLD;
+  const scoredCandidates = shortlist.slice(0, 3).map(c => ({
+    name: c.question, score: Math.round(c._pre), id: c.id, slug: c.slug, source: c._source
+  }));
 
-  // NEW — Build an entity-aware search plan (the human strategy)
-  const plan = await extractSearchPlan(marketName, resolutionCriteria, category);
-  const entities = (plan?.entities || []).map(e => e.toLowerCase()).filter(Boolean);
-  const planDate = plan?.date || resolutionDate;
-
-  // Build search queries: plan queries first, then fallbacks
-  const keywords = [];
-  if (plan?.searchQueries?.length) keywords.push(...plan.searchQueries);
-  if (userParsed?.entity) keywords.push(userParsed.entity);
-  if (plan?.event)        keywords.push(plan.event);
-  // entity pair as a combined query
-  if (entities.length >= 2) keywords.push(entities.slice(0, 2).join(" "));
-  // fallback: key nouns from the name
-  const nameWords = marketName.replace(/[?"']/g, "").split(/\s+/)
-    .filter(w => w.length > 3 &&
-      !["will","the","new","by","or","and","be","a","an","on","of","is","for","to","than","that"].includes(w.toLowerCase()))
-    .slice(0, 4);
-  keywords.push(...nameWords);
-
-  const uniqueKeywords = [...new Set(keywords.map(k => k.trim()).filter(Boolean))];
-  console.log(`[MarketMatcher] Entities: ${entities.join(", ") || "none"}`);
-  console.log(`[MarketMatcher] Search queries: ${uniqueKeywords.join(" | ")}`);
-
-  // MODEL 4 — Keyword-driven broad search
-  const candidates = await searchPolymarket(uniqueKeywords, planDate);
-  if (candidates.length === 0) {
-    return { success: false, confidence: 0, marketId: null, message: "No Polymarket candidates found" };
-  }
-
-  // MODEL 5+6 — Score candidates with ENTITY-PAIR awareness
-  const scored = [];
-  for (const candidate of candidates.slice(0, 30)) {
-    const candidateParsed = await parseCriteria(
-      candidate.description || candidate.question || ""
+  if (!success) {
+    return fail(
+      `No confident match. Verdict: ${j.verdict}. ` +
+      (best ? `Closest was "${best.question}" but it does not resolve on the same outcome.`
+            : "No candidate resolved on the same outcome."),
+      plan, candidates.length, log, scoredCandidates, j
     );
-
-    // MODEL 5 — Hard rejection
-    if (hardReject(userParsed, candidateParsed)) continue;
-
-    // MODEL 6 — Weighted scoring
-    let score = scoreCandidate(
-      userParsed, candidate, candidateParsed, marketName, planDate
-    );
-
-    // NEW — Entity co-occurrence boost/penalty.
-    // The candidate's text must contain the SAME entities.
-    const candText = `${candidate.question || ""} ${candidate.description || ""}`.toLowerCase();
-    if (entities.length > 0) {
-      const matchedEntities = entities.filter(e => candText.includes(e));
-      if (entities.length >= 2) {
-        // A two-entity match (e.g. Portugal vs Spain): BOTH must appear
-        if (matchedEntities.length >= 2)      score += 40;   // both teams present
-        else if (matchedEntities.length === 1) score -= 25;  // only one → wrong match
-        else                                   score -= 40;  // neither → reject-tier
-      } else {
-        // Single entity must appear
-        if (matchedEntities.length >= 1) score += 20;
-        else                             score -= 30;
-      }
-    }
-
-    scored.push({ candidate, candidateParsed, score });
   }
-
-  // Sort and take top 3
-  scored.sort((a, b) => b.score - a.score);
-  const top3 = scored.slice(0, 3);
-
-  if (top3.length === 0) {
-    return { success: false, confidence: 0, marketId: null, message: "All candidates rejected" };
-  }
-
-  // MODEL 7 — LLM logic comparison on best candidate
-  const best = top3[0];
-  const llmResult = await llmCompare(
-    resolutionCriteria,
-    best.candidate.description || best.candidate.question || "",
-    marketName,
-    best.candidate.question || ""
-  );
-
-  // The LLM verdict is AUTHORITATIVE. Its confidence is confidence
-  // IN THAT VERDICT — so a NO_MATCH at 0.84 means "84% sure it does
-  // NOT match", which must FAIL, not pass.
-  let finalConfidence;
-  let isRealMatch;
-
-  if (llmResult.verdict === "MATCH") {
-    finalConfidence = llmResult.confidence;        // confident it matches
-    isRealMatch = true;
-  } else if (llmResult.verdict === "PARTIAL_MATCH") {
-    finalConfidence = llmResult.confidence * 0.6;  // weak partial
-    isRealMatch = llmResult.confidence >= 0.8;     // only if strongly partial
-  } else {
-    // NO_MATCH — invert: high LLM confidence = very NOT a match
-    finalConfidence = 1 - llmResult.confidence;
-    isRealMatch = false;
-  }
-
-  // MODEL 8 — Resolution simulation only when LLM actually says MATCH
-  if (isRealMatch && finalConfidence >= 0.70) {
-    const simulation = await simulateResolution(
-      resolutionCriteria,
-      best.candidate.description || best.candidate.question || "",
-      userParsed
-    );
-    if (simulation.allAgree) {
-      finalConfidence = Math.min(finalConfidence + 0.05, 1.0);
-    } else {
-      // Simulation disagreed — this is NOT a safe match
-      finalConfidence = Math.max(finalConfidence - 0.30, 0);
-      isRealMatch = false;
-    }
-  }
-
-  // SUCCESS requires BOTH: the LLM said it's a real match AND score is high
-  const success = isRealMatch && finalConfidence >= 0.65;
 
   const result = {
-    success,
-    confidence:      success ? finalConfidence : Math.min(finalConfidence, 0.5),
-    marketId:        success ? (best.candidate.conditionId || best.candidate.condition_id || best.candidate.id) : null,
-    marketSlug:      success ? (best.candidate.slug || best.candidate.market_slug || null) : null,
-    polymarketName:  best.candidate.question,
-    llmVerdict:      llmResult.verdict,
-    llmExplanation:  llmResult.explanation,
-    message:         success ? null : `No logical match — LLM verdict: ${llmResult.verdict}. Best candidate "${best.candidate.question}" does not resolve under the same outcome.`,
-    scoredCandidates: top3.map(t => ({
-      name:  t.candidate.question,
-      score: t.score,
-      id:    t.candidate.conditionId || t.candidate.condition_id || t.candidate.id
-    }))
+    success: true, confidence: finalConfidence,
+    marketId: best.id, marketSlug: best.slug, polymarketName: best.question,
+    llmVerdict: j.verdict, llmExplanation: j.explanation, message: null,
+    searchPlan: { subjects: plan.subjects, queries: plan.searchQueries },
+    totalCandidates: candidates.length, rawSearchLog: log, scoredCandidates,
+    _criteriaRaw: resolutionCriteria
   };
-
-  // Write to memory only on a genuine confident match
-  if (success && finalConfidence >= 0.85) {
-    await writeMemory(criteriaHash, result);
-  }
-
+  if (finalConfidence >= 0.85) await writeMemory(criteriaHash, result);
   return result;
+}
+
+function fail(message, plan, total, log, scoredCandidates = [], j = null) {
+  return {
+    success: false,
+    confidence: j ? Math.min(typeof j.confidence === "number" ? j.confidence : 0, 0.5) : 0,
+    marketId: null, marketSlug: null, polymarketName: null,
+    llmVerdict: j ? j.verdict : "NO_MATCH", llmExplanation: j ? j.explanation : null,
+    message,
+    searchPlan: { subjects: plan?.subjects || [], queries: plan?.searchQueries || [] },
+    totalCandidates: total, rawSearchLog: log || [], scoredCandidates
+  };
 }
 
 module.exports = { matchMarket };

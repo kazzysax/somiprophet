@@ -5,7 +5,8 @@
 
 const WALLET_CONFIG = {
   target:           10,     // ideal wallet count for vote
-  minViable:        5,      // minimum for vote to proceed
+  minViable:        5,      // minimum for a FULL-strength vote
+  partialFloor:     2,      // 2-4 strong wallets = PARTIAL signal (not discarded)
   startingGate:     0.70,   // 70% win rate starting threshold
   stepDown:         0.05,   // 5% decrements
   floor:            0.45,   // never go below 45%

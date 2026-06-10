@@ -36,7 +36,10 @@ async function runLLM({
   // If 7 of 10 say NO          → 0.30 toward YES
   let onchainYesProb = null;
   if (hasOnchain) {
-    onchainYesProb = voteResult.yesCount / voteResult.total;
+    // Prefer conviction-weighted probability (skill × stake); fall back to raw count
+    onchainYesProb = (typeof voteResult.weightedYesProb === "number")
+      ? voteResult.weightedYesProb
+      : voteResult.yesCount / voteResult.total;
   }
 
   // ── OFFCHAIN PROBABILITY (0..1 toward YES) ────────────
@@ -109,9 +112,16 @@ async function runLLM({
     onchainReport = "No onchain wallet data available (no Polymarket market matched).";
   }
 
-  const prompt = `You are SOMIPROPHET — an ancient oracle and prediction market analyst on the Somnia blockchain.
+  // ── SIGNAL STRENGTH (how decisive each side is, 0-100%) ──
+  // 50/50 lean = 0% strength; 100/0 lean = 100% strength; no data = 0%
+  const onchainStrength  = hasOnchain   ? Math.round(Math.abs(onchainYesProb  - 0.5) * 200) : 0;
+  const offchainStrength = hasSentiment ? Math.round(Math.abs(offchainYesProb - 0.5) * 200) : 0;
+  const onchainLean  = hasOnchain   ? (onchainYesProb  >= 0.5 ? "YES" : "NO") : null;
+  const offchainLean = hasSentiment ? (offchainYesProb >= 0.5 ? "YES" : "NO") : null;
 
-You have analysed a prediction market using a multi-signal consensus model. The scoring has ALREADY been computed for you. Your job is to explain it in the oracle's voice — NOT to recompute or second-guess the numbers.
+  const prompt = `You are SOMIPROPHET — an oracle and prediction market analyst on the Somnia blockchain.
+
+The scoring has ALREADY been computed. Your job is to explain it in NATURAL, PLAIN LANGUAGE — the way a sharp human analyst would brief a friend. Not robotic stat-dumps, not vague poetry. Specific, factual, conversational.
 
 MARKET DETAILS:
   Name:                ${marketName}
@@ -120,35 +130,47 @@ MARKET DETAILS:
   Resolution Date:     ${new Date(resolutionDate).toDateString()}
   Short Duration:      ${isShortMarket ? "YES — resolves < 24 hours" : "NO"}
 
-COMPUTED SIGNALS:
-  Data available:      onchain=${hasOnchain ? "YES" : "NO"}, sentiment=${hasSentiment ? "YES" : "NO"}
-  Onchain (wallets):   ${hasOnchain ? `${onchainScore}% lean toward YES` : "no wallet data"}
-  Offchain (sentiment):${hasSentiment ? `${offchainScore}% lean toward YES` : "no sentiment data"}
-  News read:           ${sentimentResult.summary || "no news summary"}
-  Key news signal:     ${sentimentResult.keySignal || "none"}
-  ONCHAIN REPORT:      ${onchainReport}
+WHAT HAPPENED ONCHAIN (raw facts):
+  ${onchainReport}
+  Wallet diagnostics: ${walletDiagnostics ? JSON.stringify(walletDiagnostics) : "n/a"}
+  Onchain lean: ${onchainLean || "none"} · signal strength ${onchainStrength}%
+
+WHAT HAPPENED OFFCHAIN (raw facts):
+  News read: ${sentimentResult.summary || "no news summary"}
+  Key signal: ${sentimentResult.keySignal || "none"}
+  Articles analysed: ${sentimentResult.postsAnalysed ?? 0} · basis: ${sentimentResult.basis || "n/a"}
+  Offchain lean: ${offchainLean || "none"} · signal strength ${offchainStrength}%
 
 ALREADY-DECIDED OUTCOME (do not change these):
   VERDICT:      ${verdict}
   PROBABILITY:  ${verdict === "INSUFFICIENT_DATA" ? "N/A" : probabilityPct + "%"}
   CONFIDENCE:   ${confidence}
-  DATA BACKING: ${dataConfidence}
 
-RULES:
-1. If VERDICT is INSUFFICIENT_DATA, you MUST say plainly that the Prophet cannot make a call because there is no onchain wallet data and no usable sentiment. Do NOT invent a 50/50 prediction. Tell the user to wait for more market activity.
-2. If VERDICT is YES or NO, commit to it with conviction matching the CONFIDENCE level. Do NOT hedge into neutrality.
-3. The "onchain_briefing" MUST factually state what happened onchain (wallet counts, whether the vote proceeded, why) using the ONCHAIN REPORT. No vague poetry there.
+HOW TO WRITE THE BRIEFINGS (this matters):
+- onchain_briefing: Say what the model actually FOUND, naturally. Examples of the right tone:
+  "The model found no credible wallet strength on this market — only ${walletDiagnostics?.totalWalletsOnMarket ?? 0} wallets hold positions and none passed the quality bar, so no decisive onchain conclusion can be drawn."
+  "The model found only two wallets of good strength, both leaning NO — too few for a confident consensus, but a mild bearish hint."
+  "Eleven elite wallets are positioned here and nine of them are on the YES side — a strong onchain consensus."
+- offchain_briefing: Read the news like a human. Examples of the right tone:
+  "The news gives Senegal the stronger stance — recent reports highlight their unbeaten run, while Norway's coverage centres on injury doubts."
+  "Coverage is thin; the few credible pieces lean slightly NO, but nothing decisive."
+- conclusion: One or two plain sentences tying it together. Examples:
+  "With onchain silent and the news only mildly directional, there is no strong signal here — the Prophet withholds a call."
+  "Both signals point the same way; this is a confident NO."
+Use the ACTUAL numbers and facts above. Never invent wallets or articles that don't exist.
 
 Respond ONLY with this exact JSON (no markdown, no extra text):
 {
   "verdict": "${verdict}",
   "probability": "${verdict === "INSUFFICIENT_DATA" ? "N/A" : probabilityPct + "%"}",
   "confidence": "${confidence}",
-  "onchain_briefing": "Plain factual statement of what happened onchain — wallet counts, whether vote proceeded, and why",
-  "assessment": "2-3 sentence analysis in oracle voice that MATCHES the verdict above",
+  "onchain_briefing": "natural-language onchain read as described above",
+  "offchain_briefing": "natural-language news read as described above",
+  "assessment": "2-3 sentence overall analysis in a clear, human voice that MATCHES the verdict",
   "factors": ["factor 1", "factor 2", "factor 3"],
-  "prophecy": "One bold direct sentence in oracle voice that commits to the verdict (or states clearly that no reading is possible)",
+  "prophecy": "One bold direct sentence committing to the verdict (or stating clearly that no reading is possible)",
   "risks": ["risk 1", "risk 2"],
+  "conclusion": "1-2 plain sentences tying both signals together as described above",
   "onchainScore": ${onchainScore},
   "offchainScore": ${offchainScore},
   "finalScore": ${finalScore},
@@ -174,25 +196,45 @@ Respond ONLY with this exact JSON (no markdown, no extra text):
     parsed.onchainScore  = onchainScore;
     parsed.offchainScore = offchainScore;
     parsed.finalScore    = finalScore;
+    parsed.onchainStrength  = onchainStrength;
+    parsed.offchainStrength = offchainStrength;
+    parsed.onchainLean  = onchainLean;
+    parsed.offchainLean = offchainLean;
     return parsed;
   } catch (e) {
-    // Fallback if JSON parse fails
+    // Fallback if JSON parse fails — still natural, never robotic
+    const d = walletDiagnostics || {};
+    const fbOnchain = hasOnchain
+      ? `The model found ${voteResult.total} credible wallets on this market — ${voteResult.yesCount} positioned YES, ${voteResult.noCount} NO. The onchain lean is ${onchainLean} at ${onchainStrength}% strength.`
+      : `The model found no credible wallet strength on this market — ${d.totalWalletsOnMarket ?? 0} wallets present, ${d.admittedToVote ?? 0} met the quality bar (minimum ${d.minViableNeeded ?? 5}). No decisive onchain conclusion can be drawn.`;
+    const fbOffchain = hasSentiment
+      ? (sentimentResult.summary || `The news leans ${offchainLean} at ${offchainStrength}% strength.`)
+      : "No usable news signal was found within the lookback window.";
+    const fbConclusion = verdict === "INSUFFICIENT_DATA"
+      ? `Position scoring — Onchain: ${onchainStrength}%, Offchain: ${offchainStrength}%. Neither signal is strong enough; the Prophet withholds a call.`
+      : `Position scoring — Onchain: ${onchainStrength}%, Offchain: ${offchainStrength}%. The combined read points ${verdict} at ${confidence} confidence.`;
     return {
       verdict,
       probability:  verdict === "INSUFFICIENT_DATA" ? "N/A" : `${probabilityPct}%`,
       confidence,
-      onchain_briefing: onchainReport,
+      onchain_briefing: fbOnchain,
+      offchain_briefing: fbOffchain,
       assessment:   verdict === "INSUFFICIENT_DATA"
-        ? "The Prophet sees neither onchain consensus nor clear sentiment. No reading can be made — wait for the market to gather more activity."
+        ? "Neither the wallets nor the news offer a usable signal here. No reading can be made — return when the market gathers more activity."
         : `The signals lean ${verdict}. The Prophet commits to this reading at ${confidence} confidence.`,
-      factors:      [onchainReport, `Sentiment: ${sentimentResult.label || "no data"}`],
+      factors:      [fbOnchain, fbOffchain],
       prophecy:     verdict === "INSUFFICIENT_DATA"
         ? "The scrolls are blank — the Prophet cannot speak on a market with no signal."
         : `The Prophet declares: ${verdict}.`,
       risks:        ["Signal strength may shift as the market matures"],
+      conclusion:   fbConclusion,
       onchainScore,
       offchainScore,
       finalScore,
+      onchainStrength,
+      offchainStrength,
+      onchainLean,
+      offchainLean,
       gateLevel:    hasOnchain ? `${voteResult.total} wallets voted` : "Vote did not proceed"
     };
   }

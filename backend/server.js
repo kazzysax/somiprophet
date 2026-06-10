@@ -9,6 +9,7 @@ const cors      = require("cors");
 const http      = require("http");
 const WebSocket = require("ws");
 const path      = require("path");
+const axios     = require("axios");
 
 const { runProphecy }  = require("./agents/orchestrator");
 const { reactivity, agentExecutor } = require("./reactivity/somniaAgent");
@@ -163,5 +164,22 @@ server.listen(PORT, HOST, async () => {
   console.log(`Status:   ${treasury.isSafe ? "✅ Safe" : "⚠️  Low balance"}`);
   console.log("============================================\n");
 });
+
+// ── SELF-PING (keep free-tier instance awake) ─────────────
+// Render (and similar free hosts) spin down the service after
+// ~15 minutes of inactivity. Pinging our own /api/health on an
+// interval keeps the instance warm.
+const SELF_PING_URL = process.env.SELF_PING_URL || process.env.RENDER_EXTERNAL_URL;
+if (SELF_PING_URL) {
+  const PING_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+  setInterval(() => {
+    axios.get(`${SELF_PING_URL}/api/health`, { timeout: 10000 })
+      .then(() => console.log("[SelfPing] ✅ pinged self, staying awake"))
+      .catch(err => console.error("[SelfPing] ping failed:", err.message));
+  }, PING_INTERVAL_MS);
+  console.log(`[SelfPing] enabled — pinging ${SELF_PING_URL}/api/health every 10 min`);
+} else {
+  console.log("[SelfPing] disabled — set SELF_PING_URL to enable");
+}
 
 module.exports = { pushUpdate };
