@@ -64,10 +64,14 @@ class SomniaAgentBridge {
   }
 
   /**
-   * Fetch Polymarket odds via the REAL onchain Somnia JSON API agent.
-   * Returns { prophecyId, odds } once validators reach consensus.
+   * Submit a prophecy to the REAL onchain Somnia JSON API agent.
+   * Returns immediately once the tx confirms — does NOT block on
+   * the validator callback (testnet validator response times for
+   * agent calls are unbounded / unreliable). The odds + verdict
+   * land asynchronously via OddsReceived/VerdictReceived events
+   * once validator consensus is reached.
    */
-  async fetchOddsOnchain(marketName, oddsUrl, oddsSelector) {
+  async startProphecyOnchain(marketName, oddsUrl, oddsSelector) {
     if (!this.enabled) {
       return { onchain: false, reason: "Onchain agent not configured" };
     }
@@ -92,20 +96,31 @@ class SomniaAgentBridge {
         } catch (e) {}
       }
 
-      // Wait for the OddsReceived callback (validator consensus)
-      const odds = await this._waitForOdds(prophecyId);
-
       return {
         onchain:    true,
         prophecyId: prophecyId?.toString(),
-        odds,
         txHash:     tx.hash,
-        consensus:  "validator-verified"
+        status:     "pending — awaiting Somnia validator consensus"
       };
     } catch (err) {
-      console.error(`[SomniaBridge] fetchOddsOnchain error: ${err.message}`);
+      console.error(`[SomniaBridge] startProphecyOnchain error: ${err.message}`);
       return { onchain: false, reason: err.message };
     }
+  }
+
+  /**
+   * Check whether validator consensus has landed for a prophecy
+   * (non-blocking, single read).
+   */
+  async getProphecyStatus(prophecyId) {
+    const p = await this.contract.getProphecy(prophecyId);
+    return {
+      oddsReceived:    p.oddsReceived,
+      odds:            p.oddsReceived ? Number(p.polymarketOdds) / 1e8 : null,
+      verdictReceived: p.verdictReceived,
+      verdict:         p.verdictReceived ? p.verdict : null,
+      complete:        p.complete
+    };
   }
 
   /**

@@ -229,43 +229,47 @@ async function runProphecy({
     );
     const prophecy = llmAgent.data;
 
-    // ── STEP 5b: ONCHAIN SOMNIA AGENT VERIFICATION ───────
+    // ── STEP 5b: ONCHAIN SOMNIA AGENT SUBMISSION ─────────
     // If the onchain agent contract is deployed + configured,
-    // verify the verdict on-chain via REAL Somnia base agents
-    // (validator-executed, consensus-verified). Otherwise this
-    // is skipped and the off-chain reading stands.
+    // submit this prophecy to the REAL Somnia agent platform
+    // (validator-executed, consensus-verified JSON API agent).
+    // This is fire-and-forget: testnet validator response times
+    // are unbounded, so we record the tx as proof and do NOT
+    // block the off-chain reading on the callback.
     let onchainProof = null;
     if (somniaBridge.enabled && matchResult.marketId) {
       pushUpdate(requestId, {
         type: "step", step: 5,
         agent: "SOMNIA_ONCHAIN_AGENT",
-        label: "⛓️  Verifying onchain via Somnia validators...",
+        label: "⛓️  Submitting to Somnia onchain agent...",
         status: "running"
       });
 
       try {
-        // Build a compact verdict prompt for the onchain LLM agent
-        const onchainPrompt =
-          `Market: ${marketName}. ` +
-          `Onchain wallet vote: ${voteResult ? `${voteResult.yesCount} YES / ${voteResult.noCount} NO` : "none"}. ` +
-          `News sentiment: ${sentimentResult.label}. ` +
-          `Weighted score: ${prophecy.finalScore}%. ` +
-          `Answer YES or NO: will this market resolve YES?`;
+        const oddsUrl      = `https://clob.polymarket.com/markets/${matchResult.marketId}`;
+        const oddsSelector = "tokens.0.price";
 
-        // NOTE: This sends a real STT transaction to Somnia.
-        // Polymarket odds URL + selector would be passed for a
-        // full onchain fetch; here we verify the verdict.
+        const result = await somniaBridge.startProphecyOnchain(marketName, oddsUrl, oddsSelector);
+
+        if (!result.onchain) {
+          throw new Error(result.reason || "Onchain submission failed");
+        }
+
         onchainProof = {
-          attempted: true,
-          note: "Onchain agent configured — verdict can be sealed via Somnia validators"
+          attempted:  true,
+          prophecyId: result.prophecyId,
+          txHash:     result.txHash,
+          status:     result.status,
+          contract:   process.env.SOMNIA_AGENT_CONTRACT
         };
 
         pushUpdate(requestId, {
           type: "step", step: 5,
           agent: "SOMNIA_ONCHAIN_AGENT",
-          label: "⛓️  Onchain agent ready (validator consensus available)",
+          label: `⛓️  Submitted onchain (prophecy #${result.prophecyId}, tx ${result.txHash.slice(0, 10)}...) — awaiting validator consensus`,
           status: "done",
-          consensus: "validator-verified"
+          consensus: "submitted",
+          onchainProof
         });
       } catch (err) {
         pushUpdate(requestId, {
@@ -326,7 +330,8 @@ async function runProphecy({
         sentimentSummary: sentimentResult.summary || null,
         walletDiagnostics: walletDiagnostics,
         isShortMarket,
-        matchConfidence: matchResult.confidence
+        matchConfidence: matchResult.confidence,
+        onchainProof
       },
       agentSummary: {
         totalOperations: gasReport.operations,
