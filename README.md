@@ -203,6 +203,8 @@ npm run deploy:agent:testnet
 - [ ] On-chain agents live on Somnia mainnet
 - [ ] Sealed tier + prophecy NFT certificates
 - [ ] Self-learning memory matcher (competitive moat)
+- [ ] Integration of prophecy API to track wallets
+- [ ] Automated agents who trade on users variables
 
 ---
 
